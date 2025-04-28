@@ -1,137 +1,225 @@
 import numpy as np
-from PIL import Image
 import matplotlib.pyplot as plt
+from scipy import ndimage
+from scipy import optimize
+import math
 
+# Image channel operations
 
-# preprocessing the image 
+def convert_to_grayscale(image_data):
+    return np.mean(image_data[:,:,:2], axis=2)
 
-def load_and_preprocess(image_path, size = 128):
-    """this function loads in the image and does all the preprocessing, i.e., resizing to 128x128 and conversion to grayscale"""
-    img = Image.open(image_path).convert("L")
-    img = img.resize((size, size), Image.BOX)
-    return np.array(img)
+def separate_color_channels(image_data):
+    return image_data[:,:,0], image_data[:,:,1], image_data[:,:,2]
 
+def combine_color_channels(red_channel, green_channel, blue_channel):
+    shape = (red_channel.shape[0], red_channel.shape[1], 1)
+    return np.concatenate((
+        np.reshape(red_channel, shape), 
+        np.reshape(green_channel, shape),
+        np.reshape(blue_channel, shape)), axis=2)
 
-# downsampling of the image
+# Image transformations
 
-def downsample(image_array, factor = 2):
-    """creates the downsampled/domain image"""
-    h, w = image_array.shape
-    return image_array.reshape(h//factor, factor, w//factor, factor).mean(axis = (1, 3))
+def downsample_image(image_data, scale_factor):
+    new_shape = (image_data.shape[0] // scale_factor, image_data.shape[1] // scale_factor)
+    result = np.zeros(new_shape)
+    for i in range(result.shape[0]):
+        for j in range(result.shape[1]):
+            patch = image_data[i*scale_factor:(i+1)*scale_factor, j*scale_factor:(j+1)*scale_factor]
+            result[i,j] = np.mean(patch)
+    return result
 
+def apply_rotation(image_data, rotation_angle):
+    return ndimage.rotate(image_data, rotation_angle, reshape=False)
 
-def split_blocks(image_array, block_size):
-    """split image into non-overlapping blocks."""
-    h, w = image_array.shape
-    blocks = []
-    for i in range(0, h, block_size):
-        for j in range(0, w, block_size):
-            block = image_array[i:i+block_size, j:j+block_size]
-            if block.shape == (block_size, block_size):
-                blocks.append((i, j, block))
-    return blocks
+def apply_flip(image_data, flip_direction):
+    return image_data[::flip_direction,:]
 
-def compute_transformation(domain_block, range_block):
-    """Calculate optimal α and t_o with shape matching."""
+def transform_image(image_data, flip_direction, rotation_angle, contrast=1.0, brightness=0.0):
+    flipped = apply_flip(image_data, flip_direction)
+    rotated = apply_rotation(flipped, rotation_angle)
+    return contrast * rotated + brightness
 
-    upscaled_D = np.kron(domain_block, np.ones((2, 2)))  # repeats each pixel 2x2
+# Image adjustment parameters
+
+def calculate_adjustment_parameters_simple(target, source):
+    contrast = 0.75
+    brightness = (np.sum(target - contrast*source)) / target.size
+    return contrast, brightness 
+
+def calculate_adjustment_parameters(target, source):
+    X = np.concatenate((np.ones((source.size, 1)), 
+                       np.reshape(source, (source.size, 1))), axis=1)
+    y = np.reshape(target, (target.size,))
+    params, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+    return params[1], params[0]
+
+# Grayscale compression
+
+def generate_transformation_candidates(image_data, src_size, dst_size, step_size):
+    scaling = src_size // dst_size
+    candidates = []
     
-    D = upscaled_D.flatten()
-    R = range_block.flatten()
-    N = len(D)
+    for i in range((image_data.shape[0] - src_size) // step_size + 1):
+        for j in range((image_data.shape[1] - src_size) // step_size + 1):
+            source_block = downsample_image(
+                image_data[i*step_size:i*step_size+src_size, j*step_size:j*step_size+src_size], 
+                scaling)
+                
+            for flip_dir, rot_angle in transformation_options:
+                transformed = transform_image(source_block, flip_dir, rot_angle)
+                candidates.append((i, j, flip_dir, rot_angle, transformed))
+    return candidates
+
+def perform_compression(image_data, src_size, dst_size, step_size):
+    transformation_rules = []
+    candidate_transforms = generate_transformation_candidates(image_data, src_size, dst_size, step_size)
     
-    sum_D = np.sum(D)
-    sum_R = np.sum(R)
-    sum_D2 = np.sum(D**2)
-    sum_DR = np.sum(D * R)
-
-
-    denominator = N * sum_D2 - sum_D**2
-    if denominator == 0:
-        alpha = 0
-    else:
-        alpha = (N * sum_DR - sum_D * sum_R) / denominator
-
-
-    t_o = (sum_R - alpha * sum_D) / N
-
-    # applying transformation
-    transformed_block = alpha * upscaled_D + t_o
-
-    # distortion
-    distortion = np.sum((transformed_block - range_block)**2)
-
-    return alpha, t_o, distortion
-
-
-# fractal encoding
-def fractal_encode(range_image, domain_image, block_size=4):
-    """main encoding function: match domain blocks to range blocks."""
-    range_blocks = split_blocks(range_image, block_size)
-    domain_blocks = split_blocks(domain_image, block_size // 2)  # domain is downsampled
-
-    codebook = []
-    for ri, rj, r_block in range_blocks:
-        min_distortion = float('inf')
-        best_params = None
-
-        for di, dj, d_block in domain_blocks:
-            alpha, to, distortion = compute_transformation(d_block, r_block)
-            if distortion < min_distortion:
-                min_distortion = distortion
-                best_params = (di, dj, alpha, to)
-
-        codebook.append((ri, rj, *best_params))
-
-    return codebook
-
-
-def fractal_decode(codebook, initial_image, iterations=7, block_size=4):
-    """Reconstruct image from codebook."""
-    decoded = initial_image.copy()
-    domain_size = initial_image.shape[0] // 2
+    rows = image_data.shape[0] // dst_size
+    cols = image_data.shape[1] // dst_size
     
-    for _ in range(iterations):
-        domain_image = downsample(decoded, 2)
+    for row in range(rows):
+        transformation_rules.append([])
+        for col in range(cols):
+            print(f"Processing block {row+1}/{rows}, {col+1}/{cols}")
+            transformation_rules[row].append(None)
+            
+            target_block = image_data[
+                row*dst_size:(row+1)*dst_size,
+                col*dst_size:(col+1)*dst_size]
+            
+            min_error = float('inf')
+            
+            for i, j, flip_dir, rot_angle, source in candidate_transforms:
+                contrast, brightness = calculate_adjustment_parameters(target_block, source)
+                adjusted_source = contrast * source + brightness
+                error = np.sum(np.square(target_block - adjusted_source))
+                
+                if error < min_error:
+                    min_error = error
+                    transformation_rules[row][col] = (
+                        i, j, flip_dir, rot_angle, contrast, brightness)
+    return transformation_rules
+
+def reconstruct_image(transformation_rules, src_size, dst_size, step_size, iterations=8):
+    scaling = src_size // dst_size
+    height = len(transformation_rules) * dst_size
+    width = len(transformation_rules[0]) * dst_size
+    
+    reconstruction_steps = [np.random.randint(0, 256, (height, width))]
+    current_image = np.zeros((height, width))
+    
+    for iteration in range(iterations):
+        print(f"Reconstruction iteration {iteration+1}/{iterations}")
         
-        for entry in codebook:
-            ri, rj, di, dj, alpha, to = entry
-            di, dj = int(di), int(dj)  # converting to integer indices
-            
-            
-            domain_block = domain_image[di:di+2, dj:dj+2]
-            upscaled = np.kron(domain_block, np.ones((2, 2)))
-            
-            # Aapplying transformation
-            decoded[ri:ri+block_size, rj:rj+block_size] = alpha * upscaled + to
-            
-    return np.clip(decoded, 0, 255).astype(np.uint8)
+        for i in range(len(transformation_rules)):
+            for j in range(len(transformation_rules[i])):
+                rule = transformation_rules[i][j]
+                src_i, src_j, flip_dir, rot_angle, contrast, brightness = rule
+                
+                source_region = reconstruction_steps[-1][
+                    src_i*step_size:src_i*step_size+src_size,
+                    src_j*step_size:src_j*step_size+src_size]
+                
+                downsampled = downsample_image(source_region, scaling)
+                transformed = transform_image(downsampled, flip_dir, rot_angle, contrast, brightness)
+                
+                current_image[
+                    i*dst_size:(i+1)*dst_size,
+                    j*dst_size:(j+1)*dst_size] = transformed
+        
+        reconstruction_steps.append(current_image)
+        current_image = np.zeros((height, width))
+    
+    return reconstruction_steps
 
-if __name__ == "__main__":
-    # load and preprocess
-    range_image = load_and_preprocess("lena.png", 128)
-    domain_image = downsample(range_image, 2)
+# Color image compression
 
-    # encode
-    print("encoding...")
-    block_size = 4
-    codebook = fractal_encode(range_image, domain_image, block_size)
+def downsample_color_image(image_data, factor):
+    r, g, b = separate_color_channels(image_data)
+    r = downsample_image(r, factor)
+    g = downsample_image(g, factor)
+    b = downsample_image(b, factor)
+    return combine_color_channels(r, g, b)
 
-    # savinthe codebook
-    np.save("fractal_codebook.npy", codebook)
-    print(f"Encoding complete. Codebook size: {len(codebook)} entries.")
+def compress_color_image(image_data, src_size, dst_size, step_size):
+    r, g, b = separate_color_channels(image_data)
+    return [
+        perform_compression(r, src_size, dst_size, step_size),
+        perform_compression(g, src_size, dst_size, step_size),
+        perform_compression(b, src_size, dst_size, step_size)
+    ]
 
-    print("decoding...")
-    initial_image = np.random.rand(*range_image.shape) * 255
-    decoded_image = fractal_decode(codebook, initial_image)
+def reconstruct_color_image(transformations, src_size, dst_size, step_size, iterations=8):
+    r = reconstruct_image(transformations[0], src_size, dst_size, step_size, iterations)[-1]
+    g = reconstruct_image(transformations[1], src_size, dst_size, step_size, iterations)[-1]
+    b = reconstruct_image(transformations[2], src_size, dst_size, step_size, iterations)[-1]
+    return combine_color_channels(r, g, b)
 
-    Image.fromarray(decoded_image).save("decoded_result.jpg")  # Save decoded image
-    Image.fromarray(range_image.astype(np.uint8)).save("original.jpg")  # Save original
+# Visualization
 
+def display_reconstruction_steps(reconstruction_steps, reference_image=None):
+    plt.figure(figsize=(12, 8))
+    steps = len(reconstruction_steps)
+    grid_size = math.ceil(math.sqrt(steps))
+    
+    for idx, image in enumerate(reconstruction_steps):
+        plt.subplot(grid_size, grid_size, idx+1)
+        plt.imshow(image, cmap='gray', vmin=0, vmax=255, interpolation='none')
+        
+        if reference_image is None:
+            plt.title(f'Step {idx}')
+        else:
+            error = np.sqrt(np.mean(np.square(reference_image - image)))
+            plt.title(f'Step {idx} (RMSE: {error:.2f})')
+        
+        plt.axis('off')
+    
+    plt.tight_layout()
 
-    # visualize
-    plt.figure(figsize=(12, 4))
-    plt.subplot(131), plt.imshow(range_image, cmap='gray'), plt.title("Original")
-    plt.subplot(132), plt.imshow(initial_image, cmap='gray'), plt.title("Initial (Noise)")
-    plt.subplot(133), plt.imshow(decoded_image, cmap='gray'), plt.title("Decoded")
+# Configuration
+
+transformation_options = [
+    [direction, angle] 
+    for direction in [1, -1] 
+    for angle in [0, 90, 180, 270]
+]
+
+# Example usage
+
+def demonstrate_grayscale_compression():
+    original_image = plt.imread('monkey.gif')
+    grayscale_image = convert_to_grayscale(original_image)
+    reduced_image = downsample_image(grayscale_image, 4)
+    
+    plt.figure()
+    plt.imshow(reduced_image, cmap='gray', interpolation='none')
+    plt.title('Original (Reduced)')
+    
+    compression_rules = perform_compression(reduced_image, 8, 4, 8)
+    reconstruction = reconstruct_image(compression_rules, 8, 4, 8)
+    
+    display_reconstruction_steps(reconstruction, reduced_image)
     plt.show()
+
+def demonstrate_color_compression():
+    color_image = plt.imread('lena.gif')
+    reduced_color = downsample_color_image(color_image, 8)
+    
+    compression_rules = compress_color_image(reduced_color, 8, 4, 8)
+    reconstructed_color = reconstruct_color_image(compression_rules, 8, 4, 8)
+    
+    plt.figure(figsize=(10, 5))
+    plt.subplot(1, 2, 1)
+    plt.imshow(np.array(reduced_color).astype(np.uint8), interpolation='none')
+    plt.title('Original')
+    
+    plt.subplot(1, 2, 2)
+    plt.imshow(reconstructed_color.astype(np.uint8), interpolation='none')
+    plt.title('Reconstructed')
+    plt.show()
+
+if __name__ == '__main__':
+    demonstrate_grayscale_compression()
+    # demonstrate_color_compression()
