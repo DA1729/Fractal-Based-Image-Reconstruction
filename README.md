@@ -59,7 +59,15 @@ results/
   ├── Figure_2.png    # The reconstruction process 
 
 README.md
-
-
-
 ```
+
+## References
+
+- [An Introduction to Fractal Image Compression](https://www.ti.com/lit/an/bpra065/bpra065.pdf?ts=1745827705428&ref_url=https%253A%252F%252Fwww.google.com%252F), Literature Number: BPRA065, Texas Instruments Europe, October 1997.
+
+- [Fractal Image Compression](https://pvigier.github.io/2018/05/14/fractal-image-compression.html), pvigier's blog, May 2018.
+
+
+## License
+
+This project is open-source and available under the [MIT License](LICENSE).
